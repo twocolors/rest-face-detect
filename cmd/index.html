@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>rest-face-detect</title>
+
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: #111;
+        color: #ddd;
+        font: 14px monospace;
+      }
+      main {
+        max-width: 900px;
+        margin: 24px auto;
+        padding: 0 16px;
+      }
+      h1 {
+        font-size: 18px;
+        margin-bottom: 20px;
+      }
+      button,
+      input {
+        background: #222;
+        color: #ddd;
+        border: 1px solid #444;
+        padding: 7px 10px;
+        font: inherit;
+      }
+      button {
+        cursor: pointer;
+      }
+      #drop {
+        border: 1px dashed #555;
+        padding: 35px;
+        text-align: center;
+        margin: 15px 0;
+      }
+      #drop.drag {
+        border-color: #aaa;
+      }
+      #preview {
+        max-width: 100%;
+        max-height: 500px;
+        display: none;
+        margin: 15px 0;
+      }
+      #image-wrap {
+        position: relative;
+        display: none;
+      }
+      #boxes {
+        position: absolute;
+        inset: 15px 0 15px 0;
+        pointer-events: none;
+      }
+      pre {
+        white-space: pre-wrap;
+        overflow: auto;
+        background: #181818;
+        padding: 12px;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .small {
+        color: #777;
+      }
+    </style>
+  </head>
+
+  <body>
+    <main>
+      <h1>rest-face-detect</h1>
+
+      <div id="health" class="small">loading...</div>
+
+      <div id="drop">
+        Drop image here or
+        <input id="file" type="file" accept="image/jpeg,image/png,image/bmp" />
+      </div>
+
+      <div id="image-wrap">
+        <img id="preview" />
+        <canvas id="boxes"></canvas>
+      </div>
+
+      <div class="row">
+        <button onclick="analyze()">Analyze</button>
+        <button onclick="identify()">Identify</button>
+      </div>
+
+      <h3>Register</h3>
+
+      <div class="row">
+        <input id="person" placeholder="bob" />
+        <button onclick="registerPerson()">Register</button>
+      </div>
+
+      <h3>Result</h3>
+
+      <pre id="result">—</pre>
+
+      <h3>Persons</h3>
+
+      <pre id="persons">loading...</pre>
+
+      <script>
+        let image = null;
+
+        const $ = (id) => document.getElementById(id);
+
+        $("file").onchange = (e) => {
+          const f = e.target.files[0];
+          if (f) setImage(f);
+        };
+
+        $("drop").ondragover = (e) => {
+          e.preventDefault();
+          $("drop").classList.add("drag");
+        };
+
+        $("drop").ondragleave = () => $("drop").classList.remove("drag");
+
+        $("drop").ondrop = (e) => {
+          e.preventDefault();
+          $("drop").classList.remove("drag");
+
+          const f = e.dataTransfer.files[0];
+          if (f) setImage(f);
+        };
+
+        function setImage(file) {
+          image = file;
+
+          const url = URL.createObjectURL(file);
+          $("preview").src = url;
+          $("preview").style.display = "block";
+          $("image-wrap").style.display = "inline-block";
+          $("boxes")
+            .getContext("2d")
+            .clearRect(0, 0, $("boxes").width, $("boxes").height);
+
+          $("result").textContent = `image: ${file.name} (${file.type})`;
+        }
+
+        async function send(path) {
+          if (!image) {
+            $("result").textContent = "select image";
+            return;
+          }
+
+          $("result").textContent = "processing...";
+
+          const r = await fetch(path, {
+            method: "POST",
+            headers: {
+              "Content-Type": image.type || "application/octet-stream",
+            },
+            body: image,
+          });
+
+          const text = await r.text();
+
+          try {
+            const data = JSON.parse(text);
+            $("result").textContent = JSON.stringify(data, null, 2);
+
+            if (Array.isArray(data) && data.some((face) => face?.box)) {
+              const canvas = $("boxes");
+              const preview = $("preview");
+              canvas.width = preview.naturalWidth;
+              canvas.height = preview.naturalHeight;
+              canvas.style.width = `${preview.clientWidth}px`;
+              canvas.style.height = `${preview.clientHeight}px`;
+              const context = canvas.getContext("2d");
+              context.strokeStyle = "#35e06f";
+              context.fillStyle = "#35e06f";
+              context.lineWidth = 3;
+              context.font = "16px monospace";
+
+              data.forEach((face) => {
+                if (!face?.box) return;
+                const [x1, y1, x2, y2] = face.box;
+                context.strokeRect(x1, y1, x2 - x1, y2 - y1);
+                context.fillText(`face ${face.face}`, x1, Math.max(16, y1 - 5));
+              });
+            }
+          } catch {
+            $("result").textContent = text;
+          }
+        }
+
+        function analyze() {
+          send("/analyze");
+        }
+
+        function identify() {
+          send("/identify");
+        }
+
+        async function registerPerson() {
+          if (!image) {
+            $("result").textContent = "select image";
+            return;
+          }
+
+          const id = $("person").value.trim();
+
+          if (!id) {
+            $("result").textContent = "enter person id";
+            return;
+          }
+
+          $("result").textContent = "registering...";
+
+          const r = await fetch("/register/" + encodeURIComponent(id), {
+            method: "POST",
+            headers: {
+              "Content-Type": image.type || "application/octet-stream",
+            },
+            body: image,
+          });
+
+          const text = await r.text();
+
+          try {
+            $("result").textContent = JSON.stringify(JSON.parse(text), null, 2);
+          } catch {
+            $("result").textContent = text;
+          }
+
+          loadPersons();
+        }
+
+        async function loadHealth() {
+          const r = await fetch("/health");
+          const j = await r.json();
+
+          $("health").textContent =
+            `model=${j.model}  persons=${j.persons}  embeddings=${j.embeddings}`;
+        }
+
+        async function loadPersons() {
+          const r = await fetch("/register");
+          const j = await r.json();
+
+          $("persons").textContent = JSON.stringify(j, null, 2);
+        }
+
+        loadHealth();
+        loadPersons();
+      </script>
+    </main>
+  </body>
+</html>

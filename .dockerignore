@@ -1,0 +1,6 @@
+data
+models
+.git
+.gitignore
+*.zip
+README*
