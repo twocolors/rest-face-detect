@@ -127,10 +127,10 @@ func (a *App) health(w http.ResponseWriter, r *http.Request) {
 	}
 	people, embeddings, err := a.db.Counts()
 	if err != nil {
-		a.fail(w, 500, "database error", err)
+		a.fail(r, w, http.StatusInternalServerError, "database error", err)
 		return
 	}
-	writeJSON(w, 200, map[string]any{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"model":      a.model,
 		"persons":    people,
 		"embeddings": embeddings,
@@ -144,10 +144,10 @@ func (a *App) persons(w http.ResponseWriter, r *http.Request) {
 	}
 	v, err := a.db.List()
 	if err != nil {
-		a.fail(w, 500, "database error", err)
+		a.fail(r, w, http.StatusInternalServerError, "database error", err)
 		return
 	}
-	writeJSON(w, 200, v)
+	writeJSON(w, http.StatusOK, v)
 }
 
 func (a *App) person(w http.ResponseWriter, r *http.Request) {
@@ -161,12 +161,12 @@ func (a *App) person(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		image, err := readImage(w, r, a.maxBody)
 		if err != nil {
-			a.fail(w, 400, "invalid image", err)
+			a.fail(r, w, http.StatusBadRequest, "invalid image", err)
 			return
 		}
 		items, err := a.ml.EmbeddingsWithPreview(image)
 		if err != nil {
-			a.fail(w, 422, "face processing failed", err)
+			a.fail(r, w, http.StatusUnprocessableEntity, "face processing failed", err)
 			return
 		}
 		if len(items) != 1 {
@@ -174,27 +174,27 @@ func (a *App) person(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := a.db.AddEmbedding(id, items[0].Embedding, items[0].Preview); err != nil {
-			a.fail(w, 500, "database error", err)
+			a.fail(r, w, http.StatusInternalServerError, "database error", err)
 			return
 		}
 		p, _, err := a.db.Get(id)
 		if err != nil {
-			a.fail(w, 500, "database error", err)
+			a.fail(r, w, http.StatusInternalServerError, "database error", err)
 			return
 		}
-		writeJSON(w, 200, p)
+		writeJSON(w, http.StatusOK, p)
 
 	case http.MethodDelete:
 		ok, err := a.db.Delete(id)
 		if err != nil {
-			a.fail(w, 500, "database error", err)
+			a.fail(r, w, http.StatusInternalServerError, "database error", err)
 			return
 		}
 		if !ok {
 			errorJSON(w, http.StatusNotFound, "person not found")
 			return
 		}
-		writeJSON(w, 200, map[string]any{"id": id, "deleted": true})
+		writeJSON(w, http.StatusOK, map[string]any{"id": id, "deleted": true})
 
 	default:
 		errorJSON(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -209,19 +209,19 @@ func (a *App) search(w http.ResponseWriter, r *http.Request) {
 
 	image, err := readImage(w, r, a.maxBody)
 	if err != nil {
-		a.fail(w, 400, "invalid image", err)
+		a.fail(r, w, http.StatusBadRequest, "invalid image", err)
 		return
 	}
 
 	faces, err := a.ml.Embeddings(image)
 	if err != nil {
-		a.fail(w, 422, "face processing failed", err)
+		a.fail(r, w, http.StatusUnprocessableEntity, "face processing failed", err)
 		return
 	}
 
 	known, err := a.db.Embeddings()
 	if err != nil {
-		a.fail(w, 500, "database error", err)
+		a.fail(r, w, http.StatusInternalServerError, "database error", err)
 		return
 	}
 
@@ -249,7 +249,7 @@ func (a *App) search(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	writeJSON(w, 200, result)
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (a *App) analyze(w http.ResponseWriter, r *http.Request) {
@@ -259,12 +259,12 @@ func (a *App) analyze(w http.ResponseWriter, r *http.Request) {
 	}
 	image, err := readImage(w, r, a.maxBody)
 	if err != nil {
-		a.fail(w, http.StatusBadRequest, "invalid image", err)
+		a.fail(r, w, http.StatusBadRequest, "invalid image", err)
 		return
 	}
 	path, err := a.ml.Analyze(image)
 	if err != nil {
-		a.fail(w, http.StatusUnprocessableEntity, "analysis failed", err)
+		a.fail(r, w, http.StatusUnprocessableEntity, "analysis failed", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, path)
@@ -352,11 +352,17 @@ func errorJSON(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
-func (a *App) fail(w http.ResponseWriter, status int, public string, err error) {
+func (a *App) fail(r *http.Request, w http.ResponseWriter, status int, public string, err error) {
+	method, path := "", ""
+	if r != nil {
+		method = r.Method
+		path = r.URL.Path
+	}
+
 	if errors.Is(err, context.DeadlineExceeded) {
-		log.Printf("timeout status=%d public=%q", status, public)
-	} else if a.debug {
-		log.Printf("error status=%d public=%q detail=%v", status, public, err)
+		log.Printf("timeout method=%s path=%s status=%d public=%q", method, path, status, public)
+	} else {
+		log.Printf("error method=%s path=%s status=%d public=%q detail=%v", method, path, status, public, err)
 	}
 	errorJSON(w, status, public)
 }
@@ -389,11 +395,10 @@ func (a *App) withMiddleware(next http.Handler) http.Handler {
 		start := time.Now()
 		defer func() {
 			if rec := recover(); rec != nil {
-				log.Printf("panic method=%s path=%s err=%v", r.Method, r.URL.Path, rec)
-				errorJSON(rw, http.StatusInternalServerError, "internal error")
+				a.fail(r, rw, http.StatusInternalServerError, "internal error", fmt.Errorf("panic: %v", rec))
 			}
 			dur := time.Since(start)
-			log.Printf("request method=%s path=%s status=%d bytes=%d dur_ms=%d remote=%s",
+			a.debugf("request method=%s path=%s status=%d bytes=%d dur_ms=%d remote=%s",
 				r.Method,
 				r.URL.Path,
 				rw.status,

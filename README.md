@@ -13,7 +13,7 @@ It provides face detection, analysis, registration and identification, with SQLi
 | `MODEL` | `buffalo_sc` | GGUF model name, without the `.gguf` suffix |
 | `FACEDETECT_LIB` | `/usr/local/lib/libfacedetect.so` | Native shared library path |
 | `ADDR` | `:8000` | HTTP listen address |
-| `DEBUG` | `false` | Log internal error details when set to `true` |
+| `DEBUG` | `false` | Log request details and internal error details when set to `true` |
 | `UI` | `false` | Serve the optional web UI at `/` when set to `true` |
 | `IMAGE_SIZE` | `10` | Maximum request image size in MB for image endpoints |
 
