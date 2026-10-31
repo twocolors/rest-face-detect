@@ -197,6 +197,65 @@ curl -X POST \
 [{"face":1,"box":[120,80,310,340],"score":0.98,"age":34,"gender":"male"}]
 ```
 
+### ROI — optional region of interest
+
+`/identify` and `/analyze` accept an optional query parameter `roi=x,y,w,h`
+with normalized coordinates (0..1) of the frame region to search. Without the
+parameter, the whole frame is processed and the response format is unchanged.
+
+```bash
+# identify only inside the door zone (x=5%, y=0, w=62%, h=70%)
+curl -X POST \
+  -H 'Content-Type: image/jpeg' \
+  --data-binary @frame.jpg \
+  'http://localhost:8000/identify?roi=0.05,0,0.62,0.7'
+
+# detect in the top 2/3 of the frame; box is returned in original frame coordinates
+curl -X POST \
+  -H 'Content-Type: image/jpeg' \
+  --data-binary @frame.jpg \
+  'http://localhost:8000/analyze?roi=0,0,1,0.667'
+```
+
+Rules:
+
+- `x, y, w, h` are numbers from 0 to 1, comma-separated without spaces. An
+  invalid format returns `400 {"error":"..."}`.
+- The region is clipped to the frame bounds. A side smaller than 32 px returns
+  `422 "roi too small (min side 32 px)"`.
+- In `/analyze`, the `box` coordinates are always returned in the coordinate
+  system of the original (uncropped) frame, which makes it easy to merge
+  results of several zones (deduplication by IoU).
+- Node-RED scenario: one frame, several requests with different `roi` values
+  (a narrow zone gives more zoom and better small-face detection, a wide zone
+  catches the rest), results are merged on the Node-RED side.
+
+### Upscale — enlarge the frame before detection
+
+`/identify` and `/analyze` also accept an optional query parameter
+`upscale=N` (integer, 1..8). The frame (or the ROI crop, when `roi` is set
+too) is enlarged N times before face detection. This helps when the face in
+the frame is smaller than the detector's minimum size: a plain crop adds no
+pixels, upscaling makes the face large enough to be detected.
+
+```bash
+# detect a small face: crop the door zone and enlarge it 3x
+curl -X POST \
+  -H 'Content-Type: image/jpeg' \
+  --data-binary @frame.jpg \
+  'http://localhost:8000/identify?roi=0.25,0.1,0.35,0.7&upscale=3'
+```
+
+Rules:
+
+- `1..8`, integer. Anything else returns `400 {"error":"..."}`.
+- Default is `1` — without the parameter behavior is unchanged.
+- In `/analyze` with `upscale`, `box` is still returned in the coordinate
+  system of the original (uncropped, unscaled) frame.
+- Values above 3 give no systematic improvement: the embedding crop is
+  normalized to a fixed size inside the model, so extra scaling only adds
+  interpolation noise (and processing time).
+
 Errors use the following shape:
 
 ```json

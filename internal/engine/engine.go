@@ -9,13 +9,16 @@ import (
 	"image/png"
 	"math"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"unsafe"
 
-	_ "image/jpeg"
+	"image/jpeg"
 
 	"github.com/ebitengine/purego"
 	_ "golang.org/x/image/bmp"
+	"golang.org/x/image/draw"
 )
 
 type EmbeddingResult struct {
@@ -387,6 +390,183 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// ---------------------------------------------------------------------------
+// ROI — необязательная область интереса для /identify и /analyze (фича форка).
+// Нормализованные координаты (0..1): roi=x,y,w,h. Если параметр не задан,
+// поведение полностью совпадает с оригинальным сервисом (весь кадр).
+// ---------------------------------------------------------------------------
+
+type ROI struct {
+	X, Y, W, H float64
+}
+
+// ParseROI разбирает "x,y,w,h" (нормализованные значения 0..1).
+func ParseROI(s string) (*ROI, error) {
+	parts := strings.Split(s, ",")
+	if len(parts) != 4 {
+		return nil, errors.New("roi format: x,y,w,h")
+	}
+	vals := make([]float64, 4)
+	for i, p := range parts {
+		v, err := strconv.ParseFloat(strings.TrimSpace(p), 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid roi value: %q", p)
+		}
+		vals[i] = v
+	}
+	r := ROI{X: vals[0], Y: vals[1], W: vals[2], H: vals[3]}
+	if r.W <= 0 || r.H <= 0 {
+		return nil, errors.New("roi width and height must be > 0")
+	}
+	if r.X < 0 || r.Y < 0 || r.X+r.W > 1.0001 || r.Y+r.H > 1.0001 {
+		return nil, errors.New("roi outside image bounds")
+	}
+	return &r, nil
+}
+
+// cropROIImage вырезает ROI (со срезкой по границам кадра), возвращает кроп
+// и пиксельный смещение левого верхнего угла кропа относительно исходного.
+func cropROIImage(img image.Image, roi ROI) (image.Image, [2]int, error) {
+	b := img.Bounds()
+	W, H := b.Dx(), b.Dy()
+
+	x1 := b.Min.X + int(math.Round(roi.X*float64(W)))
+	y1 := b.Min.Y + int(math.Round(roi.Y*float64(H)))
+	x2 := b.Min.X + int(math.Round((roi.X + roi.W)*float64(W)))
+	y2 := b.Min.Y + int(math.Round((roi.Y + roi.H)*float64(H)))
+
+	if x1 < b.Min.X {
+		x1 = b.Min.X
+	}
+	if y1 < b.Min.Y {
+		y1 = b.Min.Y
+	}
+	if x2 > b.Max.X {
+		x2 = b.Max.X
+	}
+	if y2 > b.Max.Y {
+		y2 = b.Max.Y
+	}
+
+	if x2-x1 < 32 || y2-y1 < 32 {
+		return nil, [2]int{}, errors.New("roi too small (min side 32 px)")
+	}
+
+	// Быстрый путь: прямое копирование строк (JPEG/PNG декодируются в *image.RGBA)
+	if src, ok := img.(*image.RGBA); ok {
+		dst := image.NewRGBA(image.Rect(0, 0, x2-x1, y2-y1))
+		rowLen := (x2 - x1) * 4
+		for y := 0; y < y2-y1; y++ {
+			copy(dst.Pix[y*dst.Stride:y*dst.Stride+rowLen],
+				src.Pix[(y1+y)*src.Stride+x1*4:(y1+y)*src.Stride+x2*4])
+		}
+		return dst, [2]int{x1 - b.Min.X, y1 - b.Min.Y}, nil
+	}
+
+	dst := image.NewRGBA(image.Rect(0, 0, x2-x1, y2-y1))
+	for y := 0; y < y2-y1; y++ {
+		for x := 0; x < x2-x1; x++ {
+			dst.Set(x, y, img.At(x+x1, y+y1))
+		}
+	}
+	return dst, [2]int{x1 - b.Min.X, y1 - b.Min.Y}, nil
+}
+
+// encodeJPEG — JPEG-кодирование (C-детектор работает с файлом изображения).
+func encodeJPEG(img image.Image, quality int) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// upscaleImage увеличивает картинку в scale раз (Catmull-Rom).
+// Нужен, когда лицо в кадре меньше минимального размера детектора:
+// простой кроп (ROI) пиксели не добавляет, а апскейл делает лицо крупнее.
+func upscaleImage(img image.Image, scale int) image.Image {
+	b := img.Bounds()
+	dst := image.NewRGBA(image.Rect(0, 0, b.Dx()*scale, b.Dy()*scale))
+	draw.CatmullRom.Scale(dst, dst.Bounds(), img, b, draw.Over, nil)
+	return dst
+}
+
+// prepareCrop — декодирует картинку, вырезает ROI, при scale > 1 увеличивает
+// кроп в scale раз; возвращает JPEG-байты и пиксельное смещение кропа
+// в исходном кадре.
+func (e *Engine) prepareCrop(data []byte, roi ROI, scale int) ([]byte, [2]int, error) {
+	img, err := decodeImage(data)
+	if err != nil {
+		return nil, [2]int{}, fmt.Errorf("invalid image: %w", err)
+	}
+	crop, offset, err := cropROIImage(img, roi)
+	if err != nil {
+		return nil, [2]int{}, err
+	}
+	if scale > 1 {
+		crop = upscaleImage(crop, scale)
+	}
+	jpegBytes, err := encodeJPEG(crop, 95)
+	if err != nil {
+		return nil, [2]int{}, err
+	}
+	return jpegBytes, offset, nil
+}
+
+// EmbeddingsROI — эмбеддинги всех лиц, но только в области roi.
+// scale > 1 — апскейл кропа перед детекцией (см. upscaleImage).
+// roi == nil и scale == 1 — исходное поведение Embeddings.
+func (e *Engine) EmbeddingsROI(data []byte, roi *ROI, scale int) ([][]float32, error) {
+	if roi == nil && scale <= 1 {
+		return e.Embeddings(data)
+	}
+	if roi == nil {
+		full := ROI{X: 0, Y: 0, W: 1, H: 1}
+		roi = &full
+	}
+	cropped, _, err := e.prepareCrop(data, *roi, scale)
+	if err != nil {
+		return nil, err
+	}
+	return e.Embeddings(cropped)
+}
+
+// AnalyzeROI — как Analyze, но только по области roi; scale > 1 — апскейл.
+// roi == nil и scale == 1 — исходное поведение Analyze. Координаты "box" в
+// ответе всегда возвращаются в системе координат исходного (необрезанного,
+// неувеличенного) кадра.
+func (e *Engine) AnalyzeROI(data []byte, roi *ROI, scale int) ([]map[string]any, error) {
+	if roi == nil && scale <= 1 {
+		return e.Analyze(data)
+	}
+	if roi == nil {
+		full := ROI{X: 0, Y: 0, W: 1, H: 1}
+		roi = &full
+	}
+	cropped, offset, err := e.prepareCrop(data, *roi, scale)
+	if err != nil {
+		return nil, err
+	}
+	faces, err := e.Analyze(cropped)
+	if err != nil {
+		return nil, err
+	}
+	s := float32(scale)
+	ox, oy := float32(offset[0]), float32(offset[1])
+	for _, f := range faces {
+		box, ok := f["box"].([4]float32)
+		if !ok {
+			continue
+		}
+		box[0] = box[0]/s + ox
+		box[1] = box[1]/s + oy
+		box[2] = box[2]/s + ox
+		box[3] = box[3]/s + oy
+		f["box"] = box
+	}
+	return faces, nil
 }
 
 func writeTempImage(data []byte) (string, error) {
